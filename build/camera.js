@@ -24,12 +24,18 @@ export function rethrowIfCritical(err) {
         throw err;
     }
 }
-const INTERFACE_CLASS = 6; // PTP
+const INTERFACE_CLASS = 6; // PTP 
 const INTERFACE_SUBCLASS = 1; // MTP
 let ModulePromise;
 export class Camera {
-    #queue = Promise.resolve();
+    static #queue = Promise.resolve();
+    static #isDestroying = false;
+    static #cancellationToken = this.createCancellationToken();
     #context = null;
+    destroyCamera() {
+        Camera.#isDestroying = true;
+        this.#context?.destroyContext();
+    }
     static async showPicker() {
         // @ts-ignore
         await navigator.usb.requestDevice({
@@ -41,22 +47,26 @@ export class Camera {
             ]
         });
     }
+    static async listAvailableCameras() {
+        if (!ModulePromise) {
+            ModulePromise = initModule();
+        }
+        let Module = await ModulePromise;
+        return await Module.Context.listAvailableCameras().then((items) => {
+            return items.map((item) => {
+                const camera = new Camera();
+                // Already ready
+                camera.#context = item;
+                return camera;
+            });
+        });
+    }
     async connect() {
         if (!ModulePromise) {
             ModulePromise = initModule();
         }
         let Module = await ModulePromise;
         this.#context = await new Module.Context();
-    }
-    async #schedule(op) {
-        let res = this.#queue.then(() => op(this.#context));
-        this.#queue = res.catch(rethrowIfCritical);
-        return res;
-    }
-    async disconnect() {
-        if (this.#context && !this.#context.isDeleted()) {
-            this.#context.delete();
-        }
     }
     async getConfig() {
         return this.#schedule(context => context.configToJS());
@@ -85,5 +95,27 @@ export class Camera {
     }
     async consumeEvents() {
         return this.#schedule(context => context.consumeEvents());
+    }
+    async #schedule(op, token = Camera.#cancellationToken) {
+        if (Camera.#isDestroying || token.isCancelled) {
+            return;
+        }
+        let res = Camera.#queue.then(() => {
+            // Check the cancellation token again before executing the operation
+            if (token.isCancelled || Camera.#isDestroying) {
+                return Promise.resolve(undefined); // Operation was cancelled
+            }
+            return op(this.#context);
+        });
+        Camera.#queue = res.catch(() => null); // Assuming rethrowIfCritical is defined elsewhere
+        return res;
+    }
+    // Method to create a cancellation token
+    static createCancellationToken() {
+        return { isCancelled: false };
+    }
+    // Method to cancel all scheduled operations
+    static cancelAll() {
+        Camera.#cancellationToken.isCancelled = true;
     }
 }

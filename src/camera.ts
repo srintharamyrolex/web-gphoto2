@@ -16,91 +16,133 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
-import initModule, { Context, Module } from '../build/libapi.mjs';
+import initModule, {Context, Module} from '../build/libapi.mjs';
 
-export type { Config, SupportedOps } from '../build/libapi.mjs';
+export type {Config, SupportedOps} from '../build/libapi.mjs';
 
 // A helper that allows to distinguish critical errors from library errors.
 export function rethrowIfCritical(err: any) {
-  // If it's precisely Error, it's a custom error; anything else - SyntaxError,
-  // WebAssembly.RuntimeError, TypeError, etc. - is treated as critical here.
-  if (err?.constructor !== Error) {
-    throw err;
-  }
+    // If it's precisely Error, it's a custom error; anything else - SyntaxError,
+    // WebAssembly.RuntimeError, TypeError, etc. - is treated as critical here.
+    if (err?.constructor !== Error) {
+        throw err;
+    }
 }
 
-const INTERFACE_CLASS = 6; // PTP
+export type CancellationToken = {
+    isCancelled: boolean;
+};
+
+const INTERFACE_CLASS = 6; // PTP 
 const INTERFACE_SUBCLASS = 1; // MTP
 
 let ModulePromise: Promise<Module>;
 
 export class Camera {
-  #queue: Promise<any> = Promise.resolve();
-  #context: Context | null = null;
+    static #queue: Promise<any> = Promise.resolve();
+    static #isDestroying: boolean = false;
+    static #cancellationToken: CancellationToken = this.createCancellationToken()
+    #context: Context | null = null;
 
-  static async showPicker() {
-    // @ts-ignore
-    await navigator.usb.requestDevice({
-      filters: [
-        {
-          classCode: INTERFACE_CLASS,
-          subclassCode: INTERFACE_SUBCLASS
+    destroyCamera() {
+        Camera.#isDestroying = true;
+        this.#context?.destroyContext();
+    }
+
+    static async showPicker() {
+        // @ts-ignore
+        await navigator.usb.requestDevice({
+            filters: [
+                {
+                    classCode: INTERFACE_CLASS,
+                    subclassCode: INTERFACE_SUBCLASS
+                }
+            ]
+        });
+    }
+
+    static async listAvailableCameras() {
+        if (!ModulePromise) {
+            ModulePromise = initModule();
         }
-      ]
-    });
-  }
+        let Module = await ModulePromise;
 
-  async connect() {
-    if (!ModulePromise) {
-      ModulePromise = initModule();
+        return await Module.Context.listAvailableCameras().then((items: any) => {
+            return items.map((item: any) => {
+                const camera = new Camera();
+                // Already ready
+                camera.#context = item
+                return camera;
+            });
+        });
     }
-    let Module = await ModulePromise;
-    this.#context = await new Module.Context();
-  }
 
-  async #schedule<T>(op: (context: Context) => Promise<T>): Promise<T> {
-    let res = this.#queue.then(() => op(this.#context!));
-    this.#queue = res.catch(rethrowIfCritical);
-    return res;
-  }
-
-  async disconnect() {
-    if (this.#context && !this.#context.isDeleted()) {
-      this.#context.delete();
+    async connect() {
+        if (!ModulePromise) {
+            ModulePromise = initModule();
+        }
+        let Module = await ModulePromise;
+        this.#context = await new Module.Context();
     }
-  }
 
-  async getConfig() {
-    return this.#schedule(context => context.configToJS());
-  }
-
-  async getSupportedOps() {
-    if (this.#context) {
-      return await this.#context.supportedOps();
+    async getConfig() {
+        return this.#schedule(context => context.configToJS());
     }
-    throw new Error('You need to connect to the camera first');
-  }
 
-  async setConfigValue(name: string, value: string | number | boolean) {
-    let uiTimeout: Promise<void> | undefined;
-    await this.#schedule(context => {
-      // This is terrible, yes... but some configs return too quickly before they're actually updated.
-      // We want to wait some time before updating the UI in that case, but not block subsequent ops.
-      uiTimeout = new Promise(resolve => setTimeout(resolve, 800));
-      return context.setConfigValue(name, value);
-    });
-    await uiTimeout;
-  }
+    async getSupportedOps() {
+        if (this.#context) {
+            return await this.#context.supportedOps();
+        }
+        throw new Error('You need to connect to the camera first');
+    }
 
-  async capturePreviewAsBlob() {
-    return this.#schedule(context => context.capturePreviewAsBlob());
-  }
+    async setConfigValue(name: string, value: string | number | boolean) {
+        let uiTimeout: Promise<void> | undefined;
+        await this.#schedule(context => {
+            // This is terrible, yes... but some configs return too quickly before they're actually updated.
+            // We want to wait some time before updating the UI in that case, but not block subsequent ops.
+            uiTimeout = new Promise(resolve => setTimeout(resolve, 800));
+            return context.setConfigValue(name, value);
+        });
+        await uiTimeout;
+    }
 
-  async captureImageAsFile() {
-    return this.#schedule(context => context.captureImageAsFile());
-  }
+    async capturePreviewAsBlob() {
+        return this.#schedule(context => context.capturePreviewAsBlob());
+    }
 
-  async consumeEvents() {
-    return this.#schedule(context => context.consumeEvents());
-  }
+    async captureImageAsFile() {
+        return this.#schedule(context => context.captureImageAsFile());
+    }
+
+    async consumeEvents() {
+        return this.#schedule(context => context.consumeEvents());
+    }
+
+    async #schedule<T>(op: (context: Context) => Promise<T>, token: CancellationToken = Camera.#cancellationToken): Promise<T | undefined> {
+        if (Camera.#isDestroying || token.isCancelled) {
+            return;
+        }
+
+        let res = Camera.#queue.then(() => {
+            // Check the cancellation token again before executing the operation
+            if (token.isCancelled || Camera.#isDestroying) {
+                return Promise.resolve(undefined); // Operation was cancelled
+            }
+            return op(this.#context!);
+        });
+
+        Camera.#queue = res.catch(() => null); // Assuming rethrowIfCritical is defined elsewhere
+        return res;
+    }
+
+    // Method to create a cancellation token
+    static createCancellationToken(): CancellationToken {
+        return { isCancelled: false };
+    }
+
+    // Method to cancel all scheduled operations
+    static cancelAll() {
+        Camera.#cancellationToken.isCancelled = true;
+    }
 }

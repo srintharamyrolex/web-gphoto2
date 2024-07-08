@@ -22,8 +22,13 @@ else
 	DOCKER_INTERACTIVE_OPTS=""
 fi
 
+echo "Build"
 docker build -t web-gphoto2 - <Dockerfile
+
+echo "prepare cache"
 mkdir -p deps/.emcache
+
+echo "run"
 docker run --rm $DOCKER_INTERACTIVE_OPTS \
 	-u $(id -u):$(id -g) \
 	-v $PWD:/src \

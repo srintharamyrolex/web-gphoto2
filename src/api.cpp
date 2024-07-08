@@ -15,13 +15,16 @@
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA
  */
-
 #include <emscripten.h>
 #include <emscripten/bind.h>
 #include <emscripten/val.h>
-#include <gphoto2/gphoto2.h>
+#include <gphoto2/gphoto2-camera.h>
+#include <gphoto2/gphoto2-abilities-list.h>
+#include <gphoto2/gphoto2-port-info-list.h>
+#include <gphoto2/gphoto2-list.h>
+#include <gphoto2/gphoto2-port.h>
+#include <stdlib.h>
 
-#include <cstring>
 #include <iostream>
 
 using emscripten::val;
@@ -34,6 +37,7 @@ using GPPWidget = gpp_unique_ptr<CameraWidget, gp_widget_unref>;
 
 void gpp_try(int status) {
   if (status != GP_OK) {
+    printf("error: %s\n", gp_result_as_string(status));
     throw std::runtime_error(gp_result_as_string(status));
   }
 }
@@ -50,6 +54,21 @@ void gpp_log_error(GPContext *context, const char *text, void *data) {
     OUT;                    \
   })
 
+static GPPortInfoList *portinfolist = NULL;
+static CameraAbilitiesList *abilities = NULL;
+
+/*
+ * This detects all currently attached cameras and returns
+ * them in a list. It avoids the generic usb: entry.
+ *
+ * This function does not open nor initialize the cameras yet.
+ */
+int init_autodetect(CameraList *list, GPContext *context) {
+  gp_list_reset(list);
+  gp_camera_autodetect(list, context);
+  return gp_list_count(list);
+}
+
 const thread_local val Uint8Array = val::global("Uint8Array");
 const thread_local val Blob = val::global("Blob");
 const thread_local val File = val::global("File");
@@ -57,11 +76,30 @@ const thread_local val arrayOf = val::global("Array")["of"];
 
 class Context {
  public:
-  Context()
-      : camera(GPP_CALL(Camera *, gp_camera_new(_))),
-        context(gp_context_new()) {
-    gp_context_set_error_func(context.get(), gpp_log_error, nullptr);
-    gpp_try(gp_camera_init(camera.get(), context.get()));
+  Context() : Context(GPP_CALL(Camera *, gp_camera_new(_))) {}
+  Context(Camera *camera) : camera(camera) { }
+
+  bool destroyContext() {
+    	CameraEventType	evttype;
+			CameraFilePath	*path;
+			void    	*evtdata;
+			int		fd;
+			evtdata = NULL;
+      int i = 0;
+      while (1)
+      {
+        printf("waiting %i event\n", i++);
+        gp_camera_exit(camera.get(), Context::getContext());
+        int ret;
+        ret = gp_camera_wait_for_event (camera.get(), 2000, &evttype, &evtdata, Context::getContext());
+        if (evttype == GP_EVENT_TIMEOUT || ret != GP_OK)
+        {
+          if (evttype == GP_EVENT_TIMEOUT)
+              printf("timeout");
+            return true;
+        }
+      }
+      return false;
   }
 
   val supportedOps() {
@@ -84,8 +122,8 @@ class Context {
     for (;;) {
       CameraEventType event_type = GP_EVENT_UNKNOWN;
       gpp_unique_ptr<void, free> event_data(GPP_CALL(
-          void *, gp_camera_wait_for_event(camera.get(), 0, &event_type, _,
-                                           context.get())));
+          void *, gp_camera_wait_for_event(camera.get(), 10000, &event_type, _,
+                                           Context::getContext())));
       if (event_type == GP_EVENT_TIMEOUT) {
         break;
       }
@@ -98,15 +136,16 @@ class Context {
   }
 
   val configToJS() {
-    GPPWidget config(GPP_CALL(
-        CameraWidget *, gp_camera_get_config(camera.get(), _, context.get())));
+    GPPWidget config(
+        GPP_CALL(CameraWidget *,
+                 gp_camera_get_config(camera.get(), _, Context::getContext())));
     return walk_config(config.get()).second;
   }
 
   void setConfigValue(std::string name, val value) {
     GPPWidget widget(GPP_CALL(
         CameraWidget *, gp_camera_get_single_config(camera.get(), name.c_str(),
-                                                    _, context.get())));
+                                                    _, Context::getContext())));
     auto type = GPP_CALL(CameraWidgetType, gp_widget_get_type(widget.get(), _));
     switch (type) {
       case GP_WIDGET_RANGE: {
@@ -136,13 +175,14 @@ class Context {
       }
     }
     gpp_try(gp_camera_set_single_config(camera.get(), name.c_str(),
-                                        widget.get(), context.get()));
+                                        widget.get(), Context::getContext()));
   }
 
   val capturePreviewAsBlob() {
     auto &file = get_file();
 
-    gpp_try(gp_camera_capture_preview(camera.get(), &file, context.get()));
+    gpp_try(
+        gp_camera_capture_preview(camera.get(), &file, Context::getContext()));
 
     auto params = blob_chunks_and_opts(file);
     return Blob.new_(std::move(params.first), std::move(params.second));
@@ -158,24 +198,25 @@ class Context {
         CameraFilePath path;
 
         ~TempCameraFile() {
-          gp_camera_file_delete(&camera, path.folder, path.name, &context);
+          gp_camera_file_delete(&camera, path.folder, path.name,
+                                Context::getContext());
         }
       };
 
       TempCameraFile camera_file{
           .camera = *camera,
-          .context = *context,
+          .context = *(Context::getContext()),
       };
 
       strcpy(camera_file.path.folder, "/");
       strcpy(camera_file.path.name, "web-gphoto2");
 
       gpp_try(gp_camera_capture(camera.get(), GP_CAPTURE_IMAGE,
-                                &camera_file.path, context.get()));
+                                &camera_file.path, Context::getContext()));
 
       gpp_try(gp_camera_file_get(camera.get(), camera_file.path.folder,
                                  camera_file.path.name, GP_FILE_TYPE_NORMAL,
-                                 &file, context.get()));
+                                 &file, Context::getContext()));
     }
 
     gpp_try(gp_file_set_name(&file, "image."));
@@ -187,10 +228,59 @@ class Context {
                      std::move(params.second));
   }
 
+  static val listAvailableCameras() {
+    CameraList *list;
+    int i;
+    const char *name, *value;
+
+    GPContext *context = Context::getContext();
+    gp_list_new(&list);
+    gp_camera_autodetect(list, context);
+    int count = gp_list_count(list);
+    val cameras = val::array();
+    Camera *camera1;
+    CameraAbilities cam_abilities;
+    CameraAbilitiesList *abilities;
+    GPPortInfoList *portinfolist;
+    GPPortInfo port_info;
+
+    gp_port_info_list_new(&portinfolist);
+    gp_port_info_list_load(portinfolist);
+
+
+    gp_abilities_list_new(&abilities);
+    gp_abilities_list_load(abilities, context);
+
+    for (i = count - 1; i >= 0; i--) {
+      gp_list_get_name(list, i, &name);
+      gp_list_get_value(list, i, &value);
+
+      int portIndex = gp_port_info_list_lookup_path(portinfolist, value);
+      gp_port_info_list_get_info(portinfolist, portIndex, &port_info);
+
+      gpp_try(gp_camera_new(&camera1));
+      gpp_try(gp_camera_set_port_info(camera1, port_info));
+      gpp_try(gp_camera_init(camera1, context));
+
+      Context *c = new Context(camera1);
+      cameras.call<void>("push", c);
+    }
+
+    return cameras;
+  }
+
  private:
   gpp_unique_ptr<Camera, gp_camera_unref> camera;
-  gpp_unique_ptr<GPContext, gp_context_unref> context;
   gpp_unique_ptr<CameraFile, gp_file_unref> file;
+
+  static GPContext *context;
+  static GPContext *getContext() {
+    if (!context) {
+      context = gp_context_new();
+      gp_context_set_error_func(context, gpp_log_error, nullptr);
+    }
+    return context;
+  }
 
   static std::pair<val, val> walk_config(CameraWidget *widget) {
     val result = val::object();
@@ -308,6 +398,8 @@ class Context {
   }
 };
 
+GPContext *Context::context;
+
 EMSCRIPTEN_BINDINGS(gphoto2_js_api) {
   emscripten::class_<Context>("Context")
       .constructor<>()
@@ -316,5 +408,7 @@ EMSCRIPTEN_BINDINGS(gphoto2_js_api) {
       .function("capturePreviewAsBlob", &Context::capturePreviewAsBlob)
       .function("captureImageAsFile", &Context::captureImageAsFile)
       .function("consumeEvents", &Context::consumeEvents)
-      .function("supportedOps", &Context::supportedOps);
+      .function("supportedOps", &Context::supportedOps)
+      .function("destroyContext", &Context::destroyContext)
+      .class_function("listAvailableCameras", &Context::listAvailableCameras);
 }

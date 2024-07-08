@@ -1,5 +1,9 @@
 # Web-gPhoto2
 
+DRIVER :
+https://github.com/pbatard/libwdi/wiki/Zadig
+
+
 A gPhoto2 implementation using WebAssembly to control DSLR cameras from the browser.
 
 Powered by a [custom fork](https://github.com/RReverser/libgphoto2) of [libgphoto2](https://github.com/gphoto/libgphoto2), the [WebUSB](https://github.com/WICG/webusb) backend of [libusb](https://github.com/libusb/libusb), and WebAssembly via [Emscripten](https://emscripten.org/).
