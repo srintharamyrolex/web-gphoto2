@@ -4,3 +4,4 @@ node_modules
 !/deps/libgphoto2
 !/deps/libusb
 /src/api.o
+.idea
